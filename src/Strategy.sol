@@ -5,6 +5,8 @@ import {BaseTokenizedStrategy} from "@tokenized-strategy/BaseTokenizedStrategy.s
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IGDai} from "./interfaces/IGDai.sol";
+import {IGDaiOpenPnlFeed} from "./interfaces/IGDaiOpenPnlFeed.sol";
 
 // Import interfaces for many popular DeFi projects, or add your own!
 //import "../interfaces/<protocol>/<Interface>.sol";
@@ -25,10 +27,22 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 contract Strategy is BaseTokenizedStrategy {
     using SafeERC20 for ERC20;
 
+    IGDai public constant GDAI = IGDai(0x91993f2101cc758D0dEB7279d41e880F7dEFe827);
+    IGDaiOpenPnlFeed public constant GDAI_PNL_FEED = IGDaiOpenPnlFeed(0x8d687276543b92819F2f2B5C3faad4AD27F4440c);
+
+    address public vault;
+    uint256 public depositLimit;
+
     constructor(
         address _asset,
-        string memory _name
-    ) BaseTokenizedStrategy(_asset, _name) {}
+        string memory _name,
+        address _vault,
+        uint256 _depositLimit
+    ) BaseTokenizedStrategy(_asset, _name) {
+        vault = _vault;
+        depositLimit = _depositLimit;
+        ERC20(_asset).safeApprove(address(GDAI), type(uint256).max);
+    }
 
     /*//////////////////////////////////////////////////////////////
                 NEEDED TO BE OVERRIDEN BY STRATEGIST
@@ -45,10 +59,8 @@ contract Strategy is BaseTokenizedStrategy {
      * @param _amount The amount of 'asset' that the strategy should attemppt
      * to deposit in the yield source.
      */
-    function _deployFunds(uint256 _amount) internal override {
-        // TODO: implement deposit logice EX:
-        //
-        //      lendingpool.deposit(asset, _amount ,0);
+    function _deployFunds(uint256 _amount) internal override {        
+        GDAI.deposit(_amount, address(this));
     }
 
     /**
@@ -73,9 +85,7 @@ contract Strategy is BaseTokenizedStrategy {
      * @param _amount, The amount of 'asset' to be freed.
      */
     function _freeFunds(uint256 _amount) internal override {
-        // TODO: implement withdraw logic EX:
-        //
-        //      lendingPool.withdraw(asset, _amount);
+        GDAI.withdraw(_amount, address(this), address(this));
     }
 
     /**
@@ -100,16 +110,58 @@ contract Strategy is BaseTokenizedStrategy {
      * @return _totalAssets A trusted and accurate account for the total
      * amount of 'asset' the strategy currently holds including idle funds.
      */
-    function _harvestAndReport()
-        internal
-        override
-        returns (uint256 _totalAssets)
-    {
-        // TODO: Implement harvesting logic and accurate accounting EX:
-        //
-        //      _claminAndSellRewards();
-        //      _totalAssets = aToken.balanceof(address(this)) + ERC20(asset).balanceOf(address(this));
-        _totalAssets = ERC20(asset).balanceOf(address(this));
+    function _harvestAndReport() internal view override returns (uint256 _totalAssets) {
+        // All we need is a total assets report
+        // nothing to harvest or redeploy
+        _totalAssets = _balanceAsset() + _balanceUpdateGDAI();        
+    }
+
+    function _balanceAsset() internal view returns (uint256) {
+        return ERC20(asset).balanceOf(address(this));
+    }
+
+    function _balanceUpdateGDAI() internal view returns (uint256) {
+        uint256 gDaiShares = GDAI.balanceOf(address(this));
+        return GDAI.convertToAssets(gDaiShares);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                EXTERNAL:
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Returns the amount of asset (DAI) the strategy holds.
+    function balanceAsset() external view returns (uint256) {
+        return _balanceAsset();
+    }
+
+    /// @notice Returns the approximate asset (DAI) balance the strategy owns
+    function balanceGDAI() external view returns (uint256) {
+        return _balanceUpdateGDAI();
+    }
+
+    /// @notice nextEpochValuesRequestCount goes greater than zero
+    /// when gdai's oracle begins reporting open trader pnl to its vault 
+    /// (and thus update the vault's collateralization ratio).
+    /// This happens towards the end of each epoch.
+    function isRedemptionWindowOpen() external view returns (bool) {
+        return GDAI_PNL_FEED.nextEpochValuesRequestCount() == 0;
+    }
+
+    /// @notice request a redemption of GDAI `shares`
+    function requestGDAIRedemption(uint256 shares) external onlyManagement returns (uint256 unlockEpoch) {
+        GDAI.makeWithdrawRequest(shares, address(this));
+        unlockEpoch = GDAI.currentEpoch() + GDAI.withdrawEpochsTimelock();
+    }
+
+    /// @notice cancel request for GDAI `shares` at epoch `unlockEpoch`
+    function cancelGDAIRedemption(uint256 shares, uint256 unlockEpoch) external onlyManagement {
+        GDAI.cancelWithdrawRequest(shares, address(this), unlockEpoch);
+    }
+
+    /// @notice redeem GDAI `shares`. 
+    /// Reverts if current gdai epoch doesn't show enough requested shares to redeem.
+    function redeemGDAI(uint256 shares) external onlyManagement {
+        GDAI.redeem(shares, address(this), address(this));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -173,16 +225,23 @@ contract Strategy is BaseTokenizedStrategy {
      * @param . The address that is depositing into the strategy.
      * @return . The avialable amount the `_owner` can deposit in terms of `asset`
      *
+    */
     function availableDepositLimit(
         address _owner
     ) public view override returns (uint256) {
-        TODO: If desired Implement deposit limit logic and any needed state variables .
-        
-        EX:    
-            uint256 totalAssets = TokenizedStrategy.totalAssets();
-            return totalAssets >= depositLimit ? 0 : depositLimit - totalAssets;
+        if (_owner != vault) {
+            return 0;
+        }
+
+        uint256 _depositLimit = depositLimit;
+
+        if (_depositLimit == type(uint256).max) {
+            return type(uint256).max;
+        }
+
+        uint256 _totalAssets = TokenizedStrategy.totalAssets();
+        return _totalAssets >= _depositLimit ? 0 : _depositLimit - _totalAssets;
     }
-    */
 
     /**
      * @notice Gets the max amount of `asset` that can be withdrawn.
@@ -202,15 +261,13 @@ contract Strategy is BaseTokenizedStrategy {
      * @param . The address that is withdrawing from the strategy.
      * @return . The avialable amount that can be withdrawn in terms of `asset`
      *
+    */
     function availableWithdrawLimit(
         address _owner
     ) public view override returns (uint256) {
-        TODO: If desired Implement withdraw limit logic and any needed state variables.
-        
-        EX:    
-            return TokenizedStrategy.totalIdle();
+        uint256 redeemableShares = GDAI.withdrawRequests(address(this), GDAI.currentEpoch());
+        return TokenizedStrategy.totalIdle() + GDAI.convertToAssets(redeemableShares);
     }
-    */
 
     /**
      * @dev Optional function for a strategist to override that will
